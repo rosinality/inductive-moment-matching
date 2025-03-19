@@ -48,7 +48,7 @@ class IMMPreconditioner(nn.Module):
 
         self.time_embed_type = time_embed_type
 
-    def forward(self, input, s, t, **rest_inputs):
+    def forward(self, input, t, s, **rest_inputs):
         input = input.to(torch.float32)
         s = s.to(torch.float32).reshape(-1, 1, 1, 1)
         t = t.to(torch.float32).reshape(-1, 1, 1, 1)
