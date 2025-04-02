@@ -1,13 +1,25 @@
-from copy import deepcopy
+import argparse
 import os
+import json
+from typing import Any
 
-from slickconf import load_arg_config, instantiate, summarize
+from slickconf import instantiate, summarize, load_config
+from slickconf.loader import apply_overrides
 import torch
+from torch import nn
 from torch import distributed as dist
-from torch.distributed.tensor import DTensor
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
+from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import DTensor, distribute_tensor
 from torch import amp
 from torch.utils import data
-from tqdm import tqdm
 
 try:
     import wandb
@@ -17,7 +29,7 @@ except ImportError:
 
 from imm.config import IMMConfig
 from imm.data import LatentDataset
-from imm.fsdp import apply_compile, apply_ddp, apply_fsdp
+from imm.fsdp import apply_compile, apply_fsdp
 from imm.logger import get_logger
 from imm.loss import ddim_interpolant
 from imm.parallel_dims import ParallelDims
@@ -46,20 +58,63 @@ def update_ema(ema_model, model, decay):
         ema_params[name].detach().mul_(decay).add_(param.detach(), alpha=1 - decay)
 
 
-def get_full_state_dict(state_dict):
-    full_state_dict = {}
+class ModelManager(Stateful):
+    def __init__(self, model: nn.Module) -> None:
+        self.model = model
 
-    for k, v in state_dict.items():
-        if isinstance(v, DTensor):
-            v = v.full_tensor()
+    def state_dict(self) -> dict[str, Any]:
+        return get_model_state_dict(self.model)
 
-        full_state_dict[k] = v
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        set_model_state_dict(
+            self.model,
+            model_state_dict=state_dict,
+        )
 
-    return full_state_dict
+
+class OptimizerManager(Stateful):
+    def __init__(self, model, optimizer: torch.optim.Optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    def state_dict(self):
+        return get_optimizer_state_dict(self.model, self.optimizer)
+
+    def load_state_dict(self, state_dict):
+        set_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            optim_state_dict=state_dict,
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
+        )
+
+
+def load_config_and_checkpoint():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--conf", type=str, default=None)
+    parser.add_argument("--conf_name", type=str, default="conf")
+    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+
+    if args.ckpt is not None:
+        with open(os.path.join(args.ckpt, "config.json"), "r") as f:
+            conf = json.load(f)
+
+        conf = apply_overrides(conf, args.opts)
+        conf = IMMConfig(**conf)
+
+    else:
+        conf = load_config(
+            args.conf, IMMConfig, config_name=args.conf_name, overrides=args.opts
+        )
+
+    return conf, args.ckpt
 
 
 def main():
-    conf = load_arg_config(IMMConfig)
+    conf, ckpt = load_config_and_checkpoint()
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -102,6 +157,21 @@ def main():
     criterion = instantiate(conf.training.criterion)
     scaler = amp.GradScaler()
 
+    start_iter = 0
+    if ckpt is not None:
+        logger.info("loads checkpoint")
+
+        states = {
+            "model": ModelManager(model),
+            "model_ema": ModelManager(model_ema),
+            "optimizer": OptimizerManager(model, optimizer),
+            "scaler": scaler.state_dict(),
+            "iter": None,
+        }
+
+        dcp.load(states, checkpoint_id=ckpt)
+        start_iter = states["iter"]
+
     dataset = LatentDataset(conf.data.latent_dataset)
     sampler = data.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
@@ -112,12 +182,15 @@ def main():
         sampler=sampler,
         num_workers=8,
         multiprocessing_context="fork",
+        drop_last=True,
     )
 
     loader = infinite_loader(loader)
 
+    logger.info("starts training")
+
     running_loss = 0
-    for i in range(conf.training.n_iters):
+    for i in range(start_iter, conf.training.n_iters):
         latent_mean, latent_std, label, _ = next(loader)
         latent = latent_encoder.encode_latents(
             latent_mean.to(device), latent_std.to(device)
@@ -204,20 +277,25 @@ def main():
 
         if conf.output.save_step is not None and (i + 1) % conf.output.save_step == 0:
             checkpoint = {
-                "model": get_full_state_dict(model.state_dict()),
-                "model_ema": get_full_state_dict(model_ema.state_dict()),
-                "optimizer": get_full_state_dict(optimizer.state_dict()),
+                "model": ModelManager(model),
+                "model_ema": ModelManager(model_ema),
+                "optimizer": OptimizerManager(model, optimizer),
                 "scaler": scaler.state_dict(),
-                "conf": conf.dict(),
+                "iter": i + 1,
             }
 
-            if rank == 0:
-                os.makedirs(conf.output.output_dir, exist_ok=True)
+            output_path = os.path.join(conf.output.output_dir, f"step-{i + 1:07d}")
 
-                torch.save(
-                    checkpoint,
-                    os.path.join(conf.output.output_dir, f"model_{i + 1:07d}.pt"),
-                )
+            if rank == 0:
+                os.makedirs(output_path, exist_ok=True)
+
+                with open(os.path.join(output_path, "config.json"), "w") as f:
+                    json.dump(conf.dict(), f, ensure_ascii=False, indent=4)
+
+            dcp.save(
+                checkpoint,
+                checkpoint_id=output_path,
+            )
 
 
 if __name__ == "__main__":
